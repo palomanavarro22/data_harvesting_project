@@ -68,7 +68,7 @@ install.packages(c(
 ### 2. Clone the repository
 
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git
+git clone https://github.com/palomanavarro22/data_harvesting_project.git
 cd <repo-name>
 ```
 
