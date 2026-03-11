@@ -1,0 +1,1478 @@
+---
+title: "Data Harvesting - Spanish Newspapers"
+format: html
+editor: visual
+---
+
+# Overview
+
+This document scrapes the international sections of four major Spanish newspapers: **El Diario**, **El Mundo**, **El País**, and **La Vanguardia**. For each newspaper we collect article titles, authors, URLs, dates, city of writing origin, countries mentioned, political figures mentioned, and number of comments. At the end, all four datasets are merged into a single CSV with a `newspaper` column and an `article_id` column.
+
+------------------------------------------------------------------------
+
+# 1. El Diario
+
+## Setup
+
+```{r}
+library(xml2)
+library(rvest)
+library(httr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(countrycode)
+
+httr::set_config(
+  httr::user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64); Carlos Morán / carlos.morangq@gmail.com")
+)
+```
+
+## Download HTML
+
+```{r}
+# Download the HTML of El Diario's International section
+eldiario_url <- read_html("https://www.eldiario.es/internacional/")
+```
+
+## Titles and URLs (International filter)
+
+The front page of El Diario's international section mixes articles from other sections (society, culture, etc.). We keep only articles whose URL contains `/internacional/`.
+
+```{r}
+# Extract titles and URLs from all articles on the page
+# The title and URL are in the same <a> inside <h2 class="ni-title">
+titles_all <- eldiario_url |>
+  html_elements("h2.ni-title a") |>
+  html_text2()
+
+ref_all <- eldiario_url |>
+  html_elements("h2.ni-title a") |>
+  html_attr("href")
+
+# Keep only articles strictly from /internacional/
+# eldiario.es mixes articles from other sections (technology, society...) on its front page
+# We identify positions of articles that belong to /internacional/
+internacional_idx <- which(str_detect(ref_all, "eldiario\\.es/internacional/"))
+
+# Apply the filter to titles and URLs
+titles <- titles_all[internacional_idx]
+ref    <- ref_all[internacional_idx]
+
+length(titles)
+length(ref)
+```
+
+`internacional_idx` is a position vector we will reuse for authors to keep everything aligned.
+
+## Authors
+
+```{r}
+# Extract the author of each article
+# In eldiario.es the author is in <p class="signature"> inside an <a>
+# We extract all authors then filter with internacional_idx
+# to maintain alignment with titles and URLs
+authors_all <- eldiario_url |>
+  html_elements("h2.ni-title") |>
+  purrr::map_chr(~ {
+    # The author is in the div.ni-info next to the h2
+    # We go up to the parent and look for p.signature within the same block
+    parent <- xml2::xml_parent(.x)
+    a <- parent |>
+      html_elements("p.signature a") |>
+      html_text2()
+    if (length(a) == 0) NA_character_ else paste(a, collapse = ", ")
+  })
+
+# Filter with the same indices as titles and URLs
+authors <- authors_all[internacional_idx]
+
+length(authors)
+authors
+```
+
+For each `h2.ni-title` we go up to the parent with `xml_parent()` — which is the `div.md__new` containing both the title and the author — and look for `p.signature` within that same block. This ensures each author matches its title.
+
+## Dates
+
+```{r}
+# eldiario.es does not include the date in the URL or in a data-publish attribute
+# We set it as NA for now — it will be recovered when scraping each article body
+date <- rep(NA_character_, length(titles))
+date
+```
+
+`rep(NA_character_, length(titles))` creates a vector of NAs — one per article.
+
+## Initial tibble
+
+```{r}
+# Build the initial dataset with one row per article
+eldiario_df <- tibble(
+  title  = titles,
+  author = authors,
+  ref    = ref,
+  date   = date  # NA for now, recovered in the article scraping step
+)
+
+eldiario_df
+```
+
+## Country list
+
+```{r}
+# Build a list of all country names in Spanish from the countrycode package
+todos_paises_ed <- countrycode::codelist$cldr.name.es
+todos_paises_ed <- todos_paises_ed[!is.na(todos_paises_ed)]
+
+# Build a single regex pattern with all country names
+# \b = word boundary — prevents "Irán" from matching inside "Teherán"
+patron_paises_ed <- paste0("\\b(", paste(todos_paises_ed, collapse = "|"), ")\\b")
+```
+
+## Article scraping function
+
+```{r}
+scrape_article_ed <- function(url) {
+
+  Sys.sleep(runif(1, 1, 2))
+
+  tryCatch({
+    page <- read_html(url)
+
+    # ── DATE ──────────────────────────────────────────────────────────────────
+    fecha <- page |>
+      html_elements("time.date") |>
+      html_attr("datetime")
+
+    fecha_str <- if (length(fecha) > 0) {
+      str_extract(fecha[1], "\\d{4}-\\d{2}-\\d{2}") |>
+        as.Date() |>
+        format("%d/%m/%Y")
+    } else NA_character_
+
+    # ── CITY OF WRITING ORIGIN ─────────────────────────────────────────────
+    city <- page |>
+      html_elements("span.place") |>
+      html_text2() |>
+      str_remove("\\s*—\\s*$")
+
+    location <- if (length(city) > 0) city[1] else NA_character_
+
+    # ── COUNTRIES MENTIONED ────────────────────────────────────────────────
+    body_text <- page |>
+      html_elements("p.article-text") |>
+      html_text2() |>
+      paste(collapse = " ")
+
+    found <- str_extract_all(body_text, regex(patron_paises_ed, ignore_case = TRUE))[[1]] |>
+      unique() |>
+      (\(x) todos_paises_ed[str_to_lower(todos_paises_ed) %in% str_to_lower(x)])()
+
+    countries_str <- if (length(found) > 0) paste(found, collapse = ", ") else NA_character_
+
+    # ── POLITICAL FIGURES MENTIONED ────────────────────────────────────────
+    figuras_politicas <- c(
+      "Pedro Sánchez", "Abascal",
+      "Donald Trump", "Von der Leyen",
+      "Netanyahu", "Zelenski", "Putin",
+      "Milei", "Maduro"
+    )
+
+    patron_figuras <- paste0("\\b(", paste(figuras_politicas, collapse = "|"), ")\\b")
+
+    found_figuras <- str_extract_all(
+      body_text,
+      regex(patron_figuras, ignore_case = TRUE)
+    )[[1]] |>
+      unique()
+
+    figures_str <- if (length(found_figuras) > 0) {
+      paste(found_figuras, collapse = ", ")
+    } else NA_character_
+
+    # ── NUMBER OF COMMENTS ─────────────────────────────────────────────────
+    # The number is in <p class="comments"> alongside an icon
+    # str_extract pulls out only the digits from the text
+    comments_text <- page |>
+      html_elements("p.comments") |>
+      html_text2()
+
+    n_comments <- if (length(comments_text) > 0) {
+      str_extract(comments_text[1], "\\d+") |>
+        as.integer()
+    } else NA_integer_
+
+    # ── RESULT ────────────────────────────────────────────────────────────
+    tibble(
+      url                 = url,
+      date                = fecha_str,
+      city_writing_origin = location,
+      countries_mentioned = countries_str,
+      figures_mentioned   = figures_str,
+      n_comments          = n_comments
+    )
+
+  }, error = function(e) {
+    message("Error in: ", url, " — ", e$message)
+    tibble(
+      url                 = url,
+      date                = NA_character_,
+      city_writing_origin = NA_character_,
+      countries_mentioned = NA_character_,
+      figures_mentioned   = NA_character_,
+      n_comments          = NA_integer_
+    )
+  })
+}
+```
+
+## Scrape all articles and join
+
+```{r}
+article_details_ed <- eldiario_df$ref |>
+  map_dfr(scrape_article_ed)
+
+eldiario_df <- eldiario_df |>
+  select(-date) |>
+  left_join(article_details_ed, by = c("ref" = "url"))
+
+eldiario_df
+```
+
+The `left_join` merges the two tibbles by URL — each row in `eldiario_df` is paired with its corresponding row in `article_details_ed`. The `select(-date)` removes the placeholder NA column before joining.
+
+## Clean city of writing origin
+
+```{r}
+eldiario_df <- eldiario_df |>
+  mutate(
+    city_writing_origin = str_remove(city_writing_origin, "(?i)corresponsal en\\s*")
+  )
+
+eldiario_df
+```
+
+## Clean up environment
+
+```{r}
+# Remove all objects except the final dataframe before moving to the next newspaper
+rm(list = setdiff(ls(), "eldiario_df"))
+gc()
+```
+
+------------------------------------------------------------------------
+
+# 2. El Mundo
+
+## Setup
+
+```{r}
+library(xml2)
+library(rvest)
+library(httr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(countrycode)
+library(selenium)
+library(tibble)
+
+httr::set_config(
+  httr::user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64); Carlos Morán / carlos.morangq@gmail.com")
+)
+```
+
+## Download HTML
+
+```{r}
+el_mundo_url <- read_html("https://www.elmundo.es/internacional.html")
+```
+
+## Titles
+
+```{r}
+# Search all <h2> elements with that class and extract clean text
+titles <- el_mundo_url |>
+  html_elements("h2.ue-c-cover-content__headline") |>
+  html_text()
+
+titles
+```
+
+## Kicker (extra column)
+
+```{r}
+# We iterate article by article because not all articles have a kicker
+kicker <- el_mundo_url |>
+  html_elements("article.ue-c-cover-content") |>
+  purrr::map_chr(~ {
+    k <- .x |>
+      html_elements("span.ue-c-cover-content__kicker") |>
+      html_text2()
+    if (length(k) == 0) NA_character_ else k[1]
+  })
+
+kicker
+```
+
+## URLs
+
+```{r}
+ref <- el_mundo_url |>
+  html_elements("a.ue-c-cover-content__link") |>
+  html_attr("href")
+
+# Keep only URLs containing /internacional/
+ref <- ref[grepl("internacional", ref)]
+
+length(ref)
+ref
+```
+
+Some NAs appear for highlighted editorial articles whose URLs contain tracking parameters (`?intcmp=masnoticiasportada`). These are pinned articles, not organic feed articles.
+
+## Authors
+
+```{r}
+# First pass — clean the hidden "Redacción:" prefix added by the screen-reader span
+authors <- el_mundo_url |>
+  html_elements("article.ue-c-cover-content") |>
+  purrr::map_chr(~ {
+    nombre <- .x |>
+      html_elements("span.ue-c-cover-content__byline-name") |>
+      html_text2() |>
+      str_remove("^Redacción:\\s*")  # removes "Redacción: " from the start
+
+    rol <- .x |>
+      html_elements("span.ue-c-cover-content__byline-role") |>
+      html_text2()
+
+    if (length(nombre) == 0) return(NA_character_)
+
+    if (length(rol) > 0) {
+      paste(nombre, rol, collapse = ", ")
+    } else {
+      paste(nombre, collapse = ", ")
+    }
+  })
+
+authors
+```
+
+## Dates
+
+```{r}
+# Primary source: data-publish attribute
+# Fallback: date embedded in the article URL (YYYY/MM/DD)
+date <- el_mundo_url |>
+  html_elements("article.ue-c-cover-content") |>
+  purrr::map_chr(~ {
+    d <- .x |>
+      html_elements("[data-publish]") |>
+      html_attr("data-publish")
+
+    if (length(d) > 0) return(d[1])
+
+    # If data-publish is missing, try extracting date from the URL
+    url <- .x |>
+      html_elements("a.ue-c-cover-content__link") |>
+      html_attr("href")
+    fecha_url <- str_extract(url, "\\d{4}/\\d{2}/\\d{2}")[1]
+    if (!is.na(fecha_url)) str_replace_all(fecha_url, "/", "-") else NA_character_
+  }) |>
+  str_extract("\\d{4}-\\d{2}-\\d{2}") |>
+  as.Date(format = "%Y-%m-%d") |>
+  format("%d/%m/%Y")
+
+date
+```
+
+## Country list and article scraping function
+
+```{r}
+all_countries_em <- countrycode::codelist$cldr.name.es
+all_countries_em <- all_countries_em[!is.na(all_countries_em)]
+# One regex pattern with every country — more efficient than calling each individually
+path_countries_em <- paste0("\\b(", paste(all_countries_em, collapse = "|"), ")\\b")
+
+scrape_article_em <- function(ref) {
+  Sys.sleep(runif(1, 1, 2))
+  tryCatch({
+    page <- read_html(ref)
+    body <- page |>
+      html_elements(xpath = "//div[@class='ue-c-article__body'] | //div[@class='ue-c-article__standfirst']")
+    body_text <- body |>
+      html_text() |>
+      paste(collapse = " ")
+    countries_found <- str_extract_all(body_text, path_countries_em)[[1]] |>
+      unique() |>
+      paste(collapse = ", ")
+    if (countries_found == "") return(NA_character_)
+    return(countries_found)
+  }, error = function(e) {
+    message("Error scraping: ", ref, " — ", e$message)
+    return(NA_character_)
+  })
+}
+```
+
+## Initial tibble + countries
+
+```{r}
+el_mundo_df <- tibble(
+  title  = titles,
+  kicker = kicker,
+  author = authors |> na.omit() |> as.character(),
+  ref    = ref,
+  date   = date
+) |>
+  mutate(
+    countries_mentioned = purrr::map_chr(ref, scrape_article_em)
+  )
+```
+
+## City of writing origin
+
+```{r}
+city_writing_origin <- el_mundo_url |>
+  html_elements("article") |>
+  sapply(\(article) {
+    span <- article |>
+      html_elements("span.ue-c-cover-content__byline-location") |>
+      html_text() |>
+      str_trim()
+    if (length(span) == 0) NA_character_ else span[1]
+  })
+
+city_writing_origin
+
+el_mundo_df <- el_mundo_df |>
+  mutate(city_writing_origin = city_writing_origin)
+```
+
+## Number of comments (Selenium)
+
+```{r}
+# Start Selenium server and open Chrome
+server <- selenium_server(temp = FALSE)
+wait_for_server(server)
+driver <- SeleniumSession$new(browser = "chrome")
+
+# Helper function to dismiss the cookie banner if it appears
+dismiss_cookies_em <- function(driver) {
+  tryCatch({
+    cookie_btn <- driver$find_element(
+      using = "xpath",
+      value = "//button[contains(text(), 'Aceptar y continuar')]"
+    )
+    cookie_btn$click()
+    Sys.sleep(2)
+  }, error = function(e) invisible(NULL))
+}
+
+# Main function: navigate to each article and extract the comment count
+scrape_comments_em <- function(url) {
+  Sys.sleep(runif(1, 3, 5))
+
+  tryCatch({
+    driver$navigate(url)
+    Sys.sleep(5)
+    dismiss_cookies_em(driver)
+    Sys.sleep(2)
+
+    # Returns text like "85 comentarios" — we extract only the number
+    comments <- driver$execute_script("
+      var el = document.querySelector('.comments-btn span.ue-c-article__button-text');
+      if (el) { return el.innerText; }
+      return null;
+    ")
+
+    n <- if (is.null(comments) || comments == "") {
+      NA_integer_
+    } else {
+      as.integer(str_extract(comments, "\\d+"))
+    }
+
+    message("✅ ", url, " → ", n, " comments")
+    tibble(ref = url, n_comments = n)
+
+  }, error = function(e) {
+    message("⚠ Error in: ", url, " — ", e$message)
+    tryCatch({
+      driver <<- SeleniumSession$new(browser = "chrome")
+      message("🔄 Session restarted")
+    }, error = function(e2) message("❌ Could not restart session"))
+    tibble(ref = url, n_comments = NA_integer_)
+  })
+}
+
+# Run over all URLs
+article_comments_em <- el_mundo_df$ref |>
+  map_dfr(scrape_comments_em)
+
+# Close the browser
+tryCatch(driver$close(), error = function(e) invisible(NULL))
+tryCatch(server$stop(),  error = function(e) invisible(NULL))
+system("pkill -f chromedriver", ignore.stdout = TRUE, ignore.stderr = TRUE)
+system("pkill -f 'chrome --'",  ignore.stdout = TRUE, ignore.stderr = TRUE)
+Sys.sleep(5)
+
+# Join with the main tibble
+el_mundo_df <- el_mundo_df |>
+  left_join(article_comments_em, by = "ref")
+
+el_mundo_df
+```
+
+## Political figures mentioned
+
+```{r}
+politicians_em <- c(
+  "Pedro Sánchez", "Abascal",
+  "Donald Trump", "Von der Leyen",
+  "Netanyahu", "Zelenski", "Putin",
+  "Milei", "Maduro"
+)
+
+patron_politicians_em <- paste0("\\b(", paste(politicians_em, collapse = "|"), ")\\b")
+
+scrape_politicians_em <- function(ref) {
+  Sys.sleep(runif(1, 1, 2))
+
+  tryCatch({
+    page <- read_html(ref)
+
+    body_text <- page |>
+      html_elements(xpath = "//div[@class='ue-c-article__body'] | //div[@class='ue-c-article__standfirst']") |>
+      html_text(trim = TRUE) |>
+      paste(collapse = " ")
+
+    found_politicians <- str_extract_all(
+      body_text,
+      regex(patron_politicians_em, ignore_case = TRUE)
+    )[[1]] |>
+      unique()
+
+    politicians_str <- if (length(found_politicians) > 0) {
+      paste(found_politicians, collapse = ", ")
+    } else NA_character_
+
+    tibble(ref = ref, politicians_mentioned = politicians_str)
+
+  }, error = function(e) {
+    message("⚠ Error in: ", ref, " — ", e$message)
+    tibble(ref = ref, politicians_mentioned = NA_character_)
+  })
+}
+
+article_politicians_em <- el_mundo_df$ref |>
+  map_dfr(scrape_politicians_em)
+
+el_mundo_df <- el_mundo_df |>
+  left_join(article_politicians_em, by = "ref")
+```
+
+## Final tibble
+
+```{r}
+el_mundo_df
+```
+
+## Clean up environment
+
+```{r}
+# Remove all objects except the two final dataframes before moving to the next newspaper
+rm(list = setdiff(ls(), c("eldiario_df", "el_mundo_df")))
+gc()
+```
+
+------------------------------------------------------------------------
+
+# 3. El País
+
+## Setup
+
+```{r}
+library(xml2)
+library(rvest)
+library(scrapex)
+library(httr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(countrycode)
+library(selenium)
+
+set_config(
+  user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36; Gaspar Vigneaux / gasparvigneaux@gmail.com")
+)
+
+el_pais_url <- read_html("https://elpais.com/internacional/")
+```
+
+## Titles
+
+```{r}
+titles <- el_pais_url |>
+  html_elements("article header h2 a, article header h3 a") |>
+  html_text()
+
+titles
+```
+
+## Authors
+
+```{r}
+authors <- el_pais_url |>
+  html_elements("article") |>
+  purrr::map_chr(~ {
+    a <- .x |> html_elements("a.c_a_a") |> html_text()
+    if (length(a) == 0) NA else paste(a, collapse = ", ")
+  })
+
+authors
+```
+
+## URLs
+
+```{r}
+ref <- el_pais_url |>
+  html_elements("article header h2 a, article header h3 a") |>
+  xml_attr("href")  # using XPath attribute extraction
+
+ref
+```
+
+## Dates
+
+```{r}
+# Dates are embedded in the article URL in YYYY-MM-DD format
+date <- ref |>
+  str_extract("\\d{4}-\\d{2}-\\d{2}") |>
+  as.Date(format = "%Y-%m-%d") |>
+  format("%d/%m/%Y")
+```
+
+## Country list and article scraping function
+
+```{r}
+all_countries_ep <- countrycode::codelist$cldr.name.es
+all_countries_ep <- all_countries_ep[!is.na(all_countries_ep)]
+# One regex pattern with every country — more efficient than calling each individually
+path_countries_ep <- paste0("\\b(", paste(all_countries_ep, collapse = "|"), ")\\b")
+
+scrape_article_ep <- function(ref) {
+  Sys.sleep(runif(1, 1, 2))
+  tryCatch({
+    page <- read_html(ref)
+    body <- page |>
+      html_elements("body div main article header div p, body div main article div.a_c")
+    body_text <- body |>
+      html_text() |>
+      paste(collapse = " ")
+    countries_found <- str_extract_all(body_text, path_countries_ep)[[1]] |>
+      unique() |>
+      paste(collapse = ", ")
+    if (countries_found == "") return(NA_character_)
+    return(countries_found)
+  }, error = function(e) {
+    message("Error scraping: ", ref, " — ", e$message)
+    return(NA_character_)
+  })
+}
+```
+
+## Political figures scraping function
+
+```{r}
+scrape_figures_ep <- function(ref) {
+  Sys.sleep(runif(1, 1, 2))
+  tryCatch({
+    page <- read_html(ref)
+    body_text <- page |>
+      html_elements("body div main article header div p, body div main article div.a_c") |>
+      html_text() |>
+      paste(collapse = " ")
+
+    figuras_politicas <- c(
+      "Pedro Sánchez", "Abascal",
+      "Donald Trump", "Von der Leyen",
+      "Netanyahu", "Zelenski", "Putin",
+      "Milei", "Maduro"
+    )
+    patron_figuras <- paste0("\\b(", paste(figuras_politicas, collapse = "|"), ")\\b")
+    found <- str_extract_all(body_text, regex(patron_figuras, ignore_case = TRUE))[[1]] |> unique()
+    if (length(found) > 0) paste(found, collapse = ", ") else NA_character_
+
+  }, error = function(e) NA_character_)
+}
+```
+
+## Initial tibble + countries + political figures
+
+```{r}
+el_pais_df <- tibble(
+  title  = titles,
+  author = authors,
+  ref    = ref,
+  date   = date
+) |>
+  mutate(
+    countries_mentioned = purrr::map_chr(ref, scrape_article_ep),
+    figures_mentioned   = purrr::map_chr(ref, scrape_figures_ep)
+  )
+```
+
+## City of writing origin
+
+```{r}
+city_writing_origin <- el_pais_url |>
+  html_elements("article") |>
+  sapply(\(article) {
+    span <- article |>
+      html_elements("span.c_a_l") |>
+      html_text() |>
+      str_trim()
+    if (length(span) == 0) NA_character_ else span[1]
+  })
+
+city_writing_origin
+
+el_pais_df <- el_pais_df |>
+  mutate(city_writing_origin = city_writing_origin)
+```
+
+## Number of comments (Selenium)
+
+```{r}
+# Start session
+server <- selenium_server(temp = FALSE)
+wait_for_server(server)
+driver <- SeleniumSession$new(browser = "chrome")
+
+# Accept cookies once on the first URL
+driver$navigate(el_pais_df$ref[1])
+Sys.sleep(4)
+tryCatch({
+  cookie_btn <- driver$find_element(
+    using = "xpath",
+    value = "//button[contains(text(), 'Aceptar y continuar') or contains(text(), 'Aceptar')]"
+  )
+  cookie_btn$click()
+  message("✅ Cookie banner dismissed")
+  Sys.sleep(4)
+}, error = function(e) {
+  message("⚠ No cookie banner found")
+})
+
+scrape_comments_ep <- function(ref) {
+  Sys.sleep(runif(1, 3, 5))
+
+  tryCatch({
+    driver$navigate(ref)
+    Sys.sleep(5)
+
+    comments <- driver$execute_script("
+      var el = document.querySelector('span.disqus-comment-count');
+      if (el) { return el.innerText; }
+      else { return null; }
+    ")
+
+    n <- if (is.null(comments) || comments == "") NA_integer_ else as.integer(comments)
+    message("✅ ", ref, " → ", n, " comments")
+    tibble(ref = ref, n_comments = n)
+
+  }, error = function(e) {
+    message("⚠ Error in: ", ref, " — ", e$message)
+    tibble(ref = ref, n_comments = NA_integer_)
+  })
+}
+
+# Run over all articles
+article_comments_ep <- el_pais_df$ref |>
+  map_dfr(scrape_comments_ep)
+
+# Join with main tibble
+el_pais_df <- el_pais_df |>
+  left_join(article_comments_ep, by = "ref") |>
+  rename(n_comments = n_comments)
+
+tryCatch(driver$close(), error = function(e) invisible(NULL))
+tryCatch(server$stop(),  error = function(e) invisible(NULL))
+system("pkill -f chromedriver", ignore.stdout = TRUE, ignore.stderr = TRUE)
+system("pkill -f 'chrome --'",  ignore.stdout = TRUE, ignore.stderr = TRUE)
+Sys.sleep(5)
+
+el_pais_df
+```
+
+## Final tibble
+
+```{r}
+el_pais_df
+```
+
+## Clean up environment
+
+```{r}
+# Remove all objects except the three final dataframes before moving to the next newspaper
+rm(list = setdiff(ls(), c("eldiario_df", "el_mundo_df", "el_pais_df")))
+gc()
+```
+
+------------------------------------------------------------------------
+
+# 4. La Vanguardia
+
+## Setup
+
+```{r}
+library(scrapex)
+library(rvest)
+library(httr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(xml2)
+library(countrycode)
+library(selenium)
+
+set_config(
+  user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
+)
+
+la_vanguardia_url <- read_html("https://www.lavanguardia.com/internacional")
+```
+
+## Titles
+
+```{r}
+titles <- la_vanguardia_url |>
+  html_elements("article div h2 a") |>
+  html_text()
+
+titles
+```
+
+## Authors
+
+```{r}
+authors_lv <- la_vanguardia_url |>
+  html_elements("article div div.author, article div div span") |>
+  html_text()
+
+authors_lv
+```
+
+## URLs
+
+```{r}
+url_news_lv <- la_vanguardia_url |>
+  html_elements("article div h2 a") |>
+  xml_attr("href")
+
+url_news_lv
+```
+
+## Dates
+
+```{r}
+# Dates are embedded in the URL as an 8-digit string (YYYYMMDD)
+dates_lv <- url_news_lv |>
+  str_extract("\\d{8}") |>
+  as.Date(format = "%Y%m%d") |>
+  format("%d/%m/%Y")
+
+dates_lv
+```
+
+## Initial tibble
+
+```{r}
+la_vanguardia_df <- tibble(
+  title  = str_squish(titles),
+  author = str_squish(authors_lv),
+  url    = paste0("https://www.lavanguardia.com", url_news_lv),
+  date   = dates_lv
+)
+
+la_vanguardia_df
+```
+
+## City of writing origin
+
+```{r}
+scrape_city_lv <- function(url) {
+  Sys.sleep(runif(1, 1, 2))
+
+  tryCatch({
+    page <- read_html(url)
+
+    location <- page |>
+      html_element("p.author_location span") |>
+      html_text(trim = TRUE) |>
+      str_extract("^[^.]+") |>
+      str_squish()
+
+    if (is.na(location) || location == "") location <- NA_character_
+
+    tibble(url = url, city_writing_origin = location)
+
+  }, error = function(e) {
+    message("⚠ Error in: ", url, " — ", e$message)
+    tibble(url = url, city_writing_origin = NA_character_)
+  })
+}
+
+# Iterate over all articles
+article_cities_lv <- la_vanguardia_df$url |>
+  map_dfr(scrape_city_lv)
+
+# Join with the main tibble
+la_vanguardia_df <- la_vanguardia_df |>
+  left_join(article_cities_lv, by = "url")
+
+la_vanguardia_df
+```
+
+## Countries mentioned
+
+```{r}
+# Build the country list BEFORE the function
+todos_paises_lv <- countrycode::codelist$cldr.name.es
+todos_paises_lv <- todos_paises_lv[!is.na(todos_paises_lv)]
+patron_paises_lv <- paste0("\\b(", paste(todos_paises_lv, collapse = "|"), ")\\b")
+
+scrape_countries_lv <- function(url) {
+  Sys.sleep(runif(1, 1, 2))
+
+  tryCatch({
+    page <- read_html(url)
+
+    body_text <- page |>
+      html_elements("div.article_story") |>
+      html_text(trim = TRUE) |>
+      paste(collapse = " ")
+
+    found <- str_extract_all(body_text, regex(patron_paises_lv, ignore_case = TRUE))[[1]] |>
+      unique() |>
+      (\(x) todos_paises_lv[str_to_lower(todos_paises_lv) %in% str_to_lower(x)])()
+
+    countries_str <- if (length(found) > 0) paste(found, collapse = ", ") else NA_character_
+
+    tibble(url = url, countries_mentioned = countries_str)
+
+  }, error = function(e) {
+    message("⚠ Error in: ", url, " — ", e$message)
+    tibble(url = url, countries_mentioned = NA_character_)
+  })
+}
+
+# Iterate over all articles
+article_countries_lv <- la_vanguardia_df$url |>
+  map_dfr(scrape_countries_lv)
+
+# Join with the main tibble
+la_vanguardia_df <- la_vanguardia_df |>
+  left_join(article_countries_lv, by = "url")
+
+la_vanguardia_df
+```
+
+## Number of comments (Selenium)
+
+```{r}
+# Start session
+server <- selenium_server(temp = FALSE)
+wait_for_server(server)
+driver <- SeleniumSession$new(browser = "chrome")
+
+driver$navigate(la_vanguardia_df$url[2])
+Sys.sleep(4)
+
+# Accept cookies
+tryCatch({
+  cookie_btn <- driver$find_element(
+    using = "xpath",
+    value = "//button[contains(text(), 'Aceptar y continuar')]"
+  )
+  cookie_btn$click()
+  message("✅ Cookie banner dismissed")
+  Sys.sleep(4)
+}, error = function(e) {
+  message("⚠ No cookie banner found")
+})
+
+# Verify comment element
+comments_test <- driver$execute_script("
+  var el = document.querySelector('#social-comments-count');
+  if (el) { return el.innerText; } else { return 'element not found'; }
+")
+cat("Comments found:", comments_test, "\n")
+
+scrape_comments_lv <- function(url) {
+  Sys.sleep(runif(1, 3, 5))
+
+  tryCatch({
+    driver$navigate(url)
+    Sys.sleep(4)
+
+    comments <- driver$execute_script("
+      var el = document.querySelector('#social-comments-count');
+      if (el) { return el.innerText; }
+      else { return null; }
+    ")
+
+    tibble(url = url, n_comments = ifelse(is.null(comments), NA_character_, comments))
+
+  }, error = function(e) {
+    message("⚠ Error in: ", url, " — ", e$message)
+    tibble(url = url, n_comments = NA_character_)
+  })
+}
+
+# Run over all articles
+article_comments_lv <- la_vanguardia_df$url |>
+  map_dfr(scrape_comments_lv)
+
+# Join with main tibble
+la_vanguardia_df <- la_vanguardia_df |>
+  left_join(article_comments_lv, by = "url")
+
+la_vanguardia_df
+```
+
+## Political figures mentioned
+
+```{r}
+politicians_lv <- c(
+  "Pedro Sánchez", "Abascal",
+  "Donald Trump", "Von der Leyen",
+  "Netanyahu", "Zelenski", "Putin",
+  "Milei", "Maduro"
+)
+
+patron_politicians_lv <- paste0("\\b(", paste(politicians_lv, collapse = "|"), ")\\b")
+
+scrape_politicians_lv <- function(url) {
+  Sys.sleep(runif(1, 1, 2))
+
+  tryCatch({
+    page <- read_html(url)
+
+    body_text <- page |>
+      html_elements("div.article_story") |>
+      html_text(trim = TRUE) |>
+      paste(collapse = " ")
+
+    found_politicians <- str_extract_all(
+      body_text,
+      regex(patron_politicians_lv, ignore_case = TRUE)
+    )[[1]] |>
+      unique()
+
+    politicians_str <- if (length(found_politicians) > 0) {
+      paste(found_politicians, collapse = ", ")
+    } else NA_character_
+
+    tibble(url = url, politicians_mentioned = politicians_str)
+
+  }, error = function(e) {
+    message("⚠ Error in: ", url, " — ", e$message)
+    tibble(url = url, politicians_mentioned = NA_character_)
+  })
+}
+
+# Iterate over all articles
+article_politicians_lv <- la_vanguardia_df$url |>
+  map_dfr(scrape_politicians_lv)
+
+# Join with main tibble
+la_vanguardia_df <- la_vanguardia_df |>
+  left_join(article_politicians_lv, by = "url")
+
+la_vanguardia_df
+```
+
+## Clean up environment
+
+```{r}
+# Remove all objects except the four final dataframes
+rm(list = setdiff(ls(), c("eldiario_df", "el_mundo_df", "el_pais_df", "la_vanguardia_df")))
+gc()
+```
+
+------------------------------------------------------------------------
+
+# 5. Merge all datasets
+
+We standardize column names across the four datasets, add `newspaper` and `article_id` columns, and export a single CSV.
+
+```{r}
+library(dplyr)
+library(readr)
+
+# ── Standardize column names ───────────────────────────────────────────────────
+
+# El Diario: rename ref → url, figures_mentioned → politicians_mentioned
+eldiario_clean <- eldiario_df |>
+  rename(
+    url                  = ref,
+    politicians_mentioned = figures_mentioned
+  ) |>
+  mutate(newspaper = "eldiario.es")
+
+# El Mundo: rename ref → url; drop kicker column
+el_mundo_clean <- el_mundo_df |>
+  rename(url = ref) |>
+  select(-any_of("kicker")) |>
+  mutate(newspaper = "elmundo.es")
+
+# El País: rename ref → url, countries → countries_mentioned, figures_mentioned stays
+el_pais_clean <- el_pais_df |>
+  rename(url = ref) |>
+  rename(any_of(c(countries_mentioned = "countries",
+                  politicians_mentioned = "figures_mentioned"))) |>
+  mutate(newspaper = "elpais.com")
+
+# La Vanguardia: url column already named url
+la_vanguardia_clean <- la_vanguardia_df |>
+  mutate(
+    n_comments = as.integer(str_extract(as.character(n_comments), "\\d+")),
+    newspaper = "lavanguardia.com"
+  )
+
+# ── Bind all rows ──────────────────────────────────────────────────────────────
+
+all_newspapers <- bind_rows(
+  eldiario_clean,
+  el_mundo_clean,
+  el_pais_clean,
+  la_vanguardia_clean
+)
+
+# ── Add article_id ─────────────────────────────────────────────────────────────
+# A unique sequential ID per article across all newspapers
+all_newspapers <- all_newspapers |>
+  mutate(article_id = row_number()) |>
+  select(article_id, newspaper, everything())
+
+all_newspapers
+```
+
+## Export to CSV
+
+```{r}
+write_csv(
+  all_newspapers,
+  file = paste0("all_newspapers_", format(Sys.Date(), "%d_%m_%Y"), ".csv")
+)
+
+message("✅ CSV exported: all_newspapers_", format(Sys.Date(), "%d_%m_%Y"), ".csv")
+```
+
+## EDA
+
+```{r}
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(forcats)
+
+plot_intro(all_newspapers)
+introduce(all_newspapers)
+```
+
+
+## Graphs and Tables
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(forcats)
+
+# Shared colour palette — one colour per newspaper
+paper_colors <- c(
+  "eldiario.es"      = "#E63946",
+  "elmundo.es"       = "#457B9D",
+  "elpais.com"       = "#2D6A4F",
+  "lavanguardia.com" = "#E9C46A"
+)
+
+theme_papers <- function() {
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 15, margin = margin(b = 6)),
+      plot.subtitle    = element_text(colour = "grey45", size = 11, margin = margin(b = 10)),
+      axis.title       = element_text(size = 11),
+      legend.position  = "bottom",
+      legend.title     = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+}
+
+# Total articles per newspaper — denominator used throughout
+totals <- all_newspapers |>
+  count(newspaper, name = "total_articles")
+```
+
+
+### Articles per newspaper
+
+```{r articles-table}
+articles_per_paper <- totals |>
+  mutate(pct = round(total_articles / sum(total_articles) * 100, 1))
+
+articles_per_paper
+```
+
+```{r articles-plot}
+ggplot(articles_per_paper,
+       aes(x = fct_reorder(newspaper, pct), y = pct, fill = newspaper)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(pct, "%")), hjust = -0.3,
+            size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = paper_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(
+    title    = "Share of total articles by newspaper",
+    subtitle = "% of all scraped articles",
+    x = NULL, y = "% of corpus"
+  ) +
+  theme_papers()
+```
+
+------------------------------------------------------------------------
+
+### Average comments per newspaper
+
+```{r avg-comments-table}
+avg_comments <- all_newspapers |>
+  filter(!is.na(n_comments)) |>
+  group_by(newspaper) |>
+  summarise(
+    avg_comments    = round(mean(n_comments), 1),
+    median_comments = round(median(n_comments), 1),
+    n_articles      = n(),
+    .groups = "drop"
+  )
+
+avg_comments
+```
+
+```{r avg-comments-plot}
+ggplot(avg_comments,
+       aes(x = fct_reorder(newspaper, avg_comments), y = avg_comments,
+           fill = newspaper)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = avg_comments), hjust = -0.3,
+            size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = paper_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(
+    title    = "Average comments per article by newspaper",
+    subtitle = "Mean comments per published article (NA excluded)",
+    x = NULL, y = "Avg. comments per article"
+  ) +
+  theme_papers()
+```
+
+
+### Top 10 most commented articles
+
+Comments are shown as a ratio to each newspaper's own average, so a score of `3x` means the article received 3 times more comments than the typical article from that outlet. The dashed line marks `1x` (the newspaper average).
+
+```{r top10-comments-table}
+newspaper_avg <- all_newspapers |>
+  filter(!is.na(n_comments)) |>
+  group_by(newspaper) |>
+  summarise(avg = mean(n_comments), .groups = "drop")
+
+top10_comments <- all_newspapers |>
+  filter(!is.na(n_comments)) |>
+  left_join(newspaper_avg, by = "newspaper") |>
+  mutate(comments_ratio = round(n_comments / avg, 1)) |>
+  slice_max(order_by = comments_ratio, n = 10) |>
+  mutate(
+    short_title = str_trunc(title, 52),
+    short_title = fct_reorder(short_title, comments_ratio)
+  )
+
+top10_comments |>
+  select(newspaper, title, n_comments, comments_ratio) |>
+  arrange(desc(comments_ratio))
+```
+
+
+
+### Most frequently mentioned countries
+
+```{r countries-table}
+countries_long <- all_newspapers |>
+  filter(!is.na(countries_mentioned)) |>
+  select(article_id, newspaper, countries_mentioned) |>
+  mutate(country = str_split(countries_mentioned, ",\\s*")) |>
+  unnest(country) |>
+  mutate(country = str_squish(country)) |>
+  filter(country != "")
+
+top10_countries <- countries_long |>
+  count(country, sort = TRUE) |>
+  slice_head(n = 10) |>
+  pull(country)
+
+country_rates <- countries_long |>
+  filter(country %in% top10_countries) |>
+  count(country, newspaper) |>
+  left_join(totals, by = "newspaper") |>
+  mutate(pct = round(n / total_articles * 100, 1)) |>
+  group_by(country) |>
+  mutate(avg_pct = mean(pct)) |>
+  ungroup() |>
+  mutate(country = fct_reorder(country, avg_pct))
+
+country_rates |>
+  select(country, newspaper, n, pct) |>
+  arrange(desc(pct))
+```
+
+```{r countries-plot}
+ggplot(country_rates,
+       aes(x = country, y = pct, fill = newspaper)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = paper_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08)),
+                     labels = function(x) paste0(x, "%")) +
+  coord_flip() +
+  labs(
+    title    = "Top 10 countries mentioned — share of each newspaper's articles",
+    subtitle = "% of articles per newspaper that mention each country",
+    x = NULL, y = "% of newspaper's articles"
+  ) +
+  theme_papers()
+```
+
+
+
+### Most frequently mentioned politicians
+
+Each cell shows the percentage of that newspaper's articles that mention the political figure. Empty cells mean zero mentions.
+
+```{r politicians-table}
+politicians_long <- all_newspapers |>
+  filter(!is.na(politicians_mentioned)) |>
+  select(article_id, newspaper, politicians_mentioned) |>
+  mutate(politician = str_split(politicians_mentioned, ",\\s*")) |>
+  unnest(politician) |>
+  mutate(politician = str_squish(politician)) |>
+  filter(politician != "")
+
+heatmap_data <- politicians_long |>
+  count(politician, newspaper) |>
+  left_join(totals, by = "newspaper") |>
+  mutate(pct = round(n / total_articles * 100, 1)) |>
+  complete(politician, newspaper, fill = list(pct = 0)) |>
+  group_by(politician) |>
+  mutate(avg_pct = mean(pct)) |>
+  ungroup() |>
+  mutate(politician = fct_reorder(politician, avg_pct))
+
+heatmap_data |>
+  select(politician, newspaper, pct) |>
+  arrange(desc(pct))
+```
+
+```{r politicians-plot}
+ggplot(heatmap_data,
+       aes(x = newspaper, y = politician, fill = pct)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = ifelse(pct > 0, paste0(pct, "%"), "")),
+            size = 3.8, fontface = "bold", colour = "white") +
+  scale_fill_gradient(low = "#d4e6f1", high = "#1a5276",
+                      name = "% of articles") +
+  scale_x_discrete(guide = guide_axis(angle = 20)) +
+  labs(
+    title    = "Political figures — share of each newspaper's articles",
+    subtitle = "% of articles per newspaper that mention each figure",
+    x = NULL, y = NULL
+  ) +
+  theme_papers() +
+  theme(panel.grid = element_blank(), legend.position = "right")
+```
+
+
+### Most usual authors by newspaper
+
+```{r authors-table}
+top_authors <- all_newspapers |>
+  filter(!is.na(author), author != "") |>
+  count(newspaper, author) |>
+  left_join(totals, by = "newspaper") |>
+  mutate(pct = round(n / total_articles * 100, 1)) |>
+  group_by(newspaper) |>
+  slice_max(order_by = pct, n = 5, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(author = fct_reorder(author, pct))
+
+top_authors |>
+  select(newspaper, author, n, pct) |>
+  arrange(desc(n))
+```
+
+
+
+
+### Cities of writing origin
+
+Only cities that account for at least 2% of any single newspaper's articles are shown, to keep the chart readable.
+
+```{r cities-table}
+cities_long <- all_newspapers |>
+  filter(!is.na(city_writing_origin), city_writing_origin != "") |>
+  mutate(city = str_squish(city_writing_origin)) |>
+  count(city, newspaper) |>
+  left_join(totals, by = "newspaper") |>
+  mutate(pct = round(n / total_articles * 100, 1))
+
+top_cities <- cities_long |>
+  group_by(city) |>
+  filter(any(pct >= 2)) |>
+  mutate(avg_pct = mean(pct)) |>
+  ungroup() |>
+  mutate(city = fct_reorder(city, avg_pct))
+
+top_cities |>
+  group_by(city) |>
+  summarise(
+    avg_pct    = round(mean(pct), 1),
+    newspapers = paste(newspaper, collapse = ", "),
+    .groups    = "drop"
+  ) |>
+  arrange(desc(avg_pct))
+```
+
+```{r cities-plot}
+ggplot(top_cities,
+       aes(x = city, y = pct, fill = newspaper)) +
+  geom_col(position = "dodge", width = 0.7) +
+  scale_fill_manual(values = paper_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08)),
+                     labels = function(x) paste0(x, "%")) +
+  coord_flip() +
+  labs(
+    title    = "Cities of writing origin",
+    subtitle = "% of each newspaper's articles filed from each city",
+    x = NULL, y = "% of newspaper's articles"
+  ) +
+  theme_papers()
+```
+
