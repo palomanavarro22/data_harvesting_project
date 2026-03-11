@@ -159,4 +159,5 @@ This dataset was built to support research on **media agenda-setting and interna
 
 ## 👥 Authors
 Carlos Morán García-Quijada, Paloma Navarro, Gaspar Vigneaux Poirot
+
 MSc in Computational Social Science — Universidad Carlos III de Madrid (UC3M), 2025–2026.
